@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Infinite Craft Explorer</title>
+    <link rel="stylesheet" href="sidepanel.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Infinite Craft Explorer</h1>
+      <span id="state" class="pill">—</span>
+    </header>
+
+    <div id="notab" class="banner" hidden>
+      Ouvrez <a href="https://neal.fun/infinite-craft/" target="_blank">neal.fun/infinite-craft</a> dans un onglet, puis revenez ici.
+    </div>
+    <div id="warnings"></div>
+
+    <main id="main">
+      <section class="controls">
+        <button id="btn-start" class="primary">Démarrer</button>
+        <button id="btn-pause">Pause</button>
+        <button id="btn-stop" class="danger">Stop</button>
+      </section>
+
+      <section>
+        <h2>Niveau de puissance</h2>
+        <div class="seg" id="levels">
+          <button data-level="eco">ÉCO</button>
+          <button data-level="normal">NORMAL</button>
+          <button data-level="turbo">TURBO</button>
+          <button data-level="max">MAX</button>
+        </div>
+        <p class="hint" id="level-hint"></p>
+      </section>
+
+      <section>
+        <h2>Statistiques</h2>
+        <div class="grid" id="stats"></div>
+      </section>
+
+      <section>
+        <h2>Dernières découvertes</h2>
+        <ol id="recent" class="recent"></ol>
+      </section>
+
+      <section>
+        <h2>Cache</h2>
+        <div class="row">
+          <button id="btn-export">Exporter JSON</button>
+          <label class="button">Importer JSON<input id="file-import" type="file" accept="application/json,.json" hidden /></label>
+          <button id="btn-clear" class="danger">Effacer</button>
+        </div>
+      </section>
+
+      <details>
+        <summary>Réglages</summary>
+        <form id="settings">
+          <label>Méthode de fusion
+            <select name="backend">
+              <option value="auto">Auto (recommandé)</option>
+              <option value="game">Jeu (IC.craft : le jeu ajoute l'élément)</option>
+              <option value="api">API du jeu (craftApi) + ajout par l'extension</option>
+              <option value="fetch">Requête directe /pair + ajout par l'extension</option>
+              <option value="dom">Glisser-déposer simulé (secours)</option>
+            </select>
+          </label>
+          <fieldset>
+            <legend>Délai entre requêtes (ms)</legend>
+            <label>ÉCO <input type="number" name="delay.eco" min="0" step="50" placeholder="1500" /></label>
+            <label>NORMAL <input type="number" name="delay.normal" min="0" step="50" placeholder="600" /></label>
+            <label>TURBO <input type="number" name="delay.turbo" min="0" step="10" placeholder="200" /></label>
+            <label>MAX <input type="number" name="delay.max" min="0" step="10" placeholder="80" /></label>
+          </fieldset>
+          <fieldset>
+            <legend>Algorithme</legend>
+            <label>Bandit
+              <select name="planner.bandit">
+                <option value="ucb">UCB1</option>
+                <option value="thompson">Thompson sampling</option>
+              </select>
+            </label>
+            <label>Seuil exploration (rendement) <input type="number" name="exploreThreshold" step="0.01" min="0" max="1" /></label>
+            <label>Seuil exploitation (rendement) <input type="number" name="exploitThreshold" step="0.01" min="0" max="1" /></label>
+            <label>Essais avant « mort » <input type="number" name="planner.deadMinTries" min="1" /></label>
+            <label>Longueur max. des noms <input type="number" name="planner.maxNameLength" min="5" /></label>
+            <label>Poids rendement <input type="number" name="weights.yield" step="0.05" /></label>
+            <label>Constante d'exploration C <input type="number" name="weights.explorationC" step="0.05" /></label>
+            <label>Poids fraîcheur <input type="number" name="weights.fresh" step="0.05" /></label>
+            <label>Poids faible profondeur <input type="number" name="weights.depth" step="0.05" /></label>
+            <label>Pénalité éléments morts <input type="number" name="weights.dead" step="0.05" /></label>
+            <label>Pénalité noms longs <input type="number" name="weights.length" step="0.05" /></label>
+            <label>Pénalité saturation <input type="number" name="weights.saturation" step="0.05" /></label>
+            <label>Bonus zones fertiles <input type="number" name="weights.fertile" step="0.05" /></label>
+            <label>Bruit aléatoire <input type="number" name="weights.noise" step="0.01" /></label>
+          </fieldset>
+          <fieldset>
+            <legend>Comportement</legend>
+            <label class="check"><input type="checkbox" name="cooldown" /> Pause de refroidissement (MAX : 10 s / 10 min)</label>
+            <label class="check"><input type="checkbox" name="autoResume" /> Reprendre après rechargement de l'onglet</label>
+            <label class="check"><input type="checkbox" name="reloadOnStop" /> Recharger le jeu à l'arrêt si nécessaire</label>
+          </fieldset>
+          <label>Liste noire (un élément par ligne, jamais utilisé)
+            <textarea name="blacklist" rows="4"></textarea>
+          </label>
+          <label>Liste blanche (un élément par ligne, prioritaire)
+            <textarea name="whitelist" rows="4"></textarea>
+          </label>
+          <button type="submit" class="primary">Enregistrer</button>
+        </form>
+      </details>
+
+      <details>
+        <summary>Journal</summary>
+        <ul id="logs" class="logs"></ul>
+      </details>
+    </main>
+    <script src="sidepanel.js"></script>
+  </body>
+</html>

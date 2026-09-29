@@ -1,0 +1,68 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Infinite Craft (maquette de test)</title></head>
+<body>
+<!--
+  Maquette du jeu utilisée UNIQUEMENT pour les tests E2E hors ligne.
+  Elle reproduit l'interface interne documentée par les userscripts
+  communautaires : window.IC, .container.__vue__ (items, craftApi, craft,
+  currSave), IndexedDB « infinite-craft » / store « items » (clé [saveId,id]).
+-->
+<div class="container"><div class="sidebar"><input class="sidebar-input"><div class="items"></div></div></div>
+<script>
+(async function () {
+  const db = await new Promise((res, rej) => {
+    const r = indexedDB.open('infinite-craft', 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('items', { keyPath: ['saveId', 'id'] });
+    r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+  });
+  const SAVE = 1;
+  let items = await new Promise((res) => {
+    const q = db.transaction('items').objectStore('items').getAll();
+    q.onsuccess = () => res(q.result.filter((x) => x.saveId === SAVE));
+  });
+  if (!items.length) {
+    items = [['Water','💧'],['Fire','🔥'],['Wind','🌬️'],['Earth','🌍']].map(([text, emoji], id) => ({ saveId: SAVE, id, text, emoji, discovery: false, recipes: [] }));
+    const tx = db.transaction('items', 'readwrite');
+    for (const it of items) tx.objectStore('items').put(it);
+  }
+  items.sort((a, b) => a.id - b.id);
+  const instances = [];
+  let instanceId = 0;
+  const vue = {
+    items, currSave: SAVE,
+    async craftApi(a, b) {
+      try {
+        const r = await fetch('/api/infinite-craft/pair?first=' + encodeURIComponent(a) + '&second=' + encodeURIComponent(b));
+        if (!r.ok) return null;
+        const d = await r.json();
+        return { text: d.result, emoji: d.emoji, discovery: d.isNew };
+      } catch (e) { return null; }
+    },
+    async craft(i1, i2) {
+      const res = await this.craftApi(i1.text, i2.text);
+      if (!res || res.text === 'Nothing') return null;
+      let item = this.items.find((x) => x.text.toLowerCase() === res.text.toLowerCase());
+      if (!item) {
+        item = { saveId: SAVE, id: Math.max(...this.items.map((x) => x.id)) + 1, text: res.text, emoji: res.emoji, discovery: res.discovery, recipes: [[i1.itemId, i2.itemId]] };
+        this.items.push(item);
+        db.transaction('items', 'readwrite').objectStore('items').put(item);
+      }
+      const inst = { id: ++instanceId, text: item.text, emoji: item.emoji, itemId: item.id, x: i1.x, y: i1.y };
+      instances.push(inst);
+      return { instance: inst };
+    }
+  };
+  document.querySelector('.container').__vue__ = vue;
+  window.IC = {
+    getItems: () => vue.items,
+    getInstances: () => instances,
+    createInstance: async (o) => { const i = { id: ++instanceId, ...o }; instances.push(i); return i; },
+    craft: (a, b) => vue.craft(a, b),
+    removeInstances: (list) => { for (const i of list) { const k = instances.indexOf(i); if (k >= 0) instances.splice(k, 1); } }
+  };
+  window.__mock = { vue, instances, db };
+})();
+</script>
+</body>
+</html>
