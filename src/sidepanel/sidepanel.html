@@ -24,6 +24,23 @@
         <button id="btn-stop" class="danger">Stop</button>
       </section>
 
+      <section id="focus-section">
+        <h2>One object</h2>
+        <p class="hint">Choisissez un objet : il sera fusionné avec <b>chaque</b> élément découvert (les meilleurs partenaires d'abord, puis tous les autres, y compris ceux découverts pendant l'opération). Les paires déjà connues ne sont jamais renvoyées.</p>
+        <input id="focus-input" list="focus-list" placeholder="Rechercher un objet possédé…" autocomplete="off" />
+        <datalist id="focus-list"></datalist>
+        <label class="check"><input type="checkbox" id="focus-then" /> Puis reprendre l'exploration normale</label>
+        <div class="row">
+          <button id="btn-focus" class="primary">Fusionner avec tout</button>
+          <button id="btn-focus-cancel" hidden>Annuler</button>
+        </div>
+        <div id="focus-status" hidden>
+          <div class="progress"><div id="focus-bar"></div></div>
+          <p id="focus-text" class="hint"></p>
+          <ol id="focus-found" class="recent"></ol>
+        </div>
+      </section>
+
       <section>
         <h2>Niveau de puissance</h2>
         <div class="seg" id="levels">
@@ -94,6 +111,7 @@
             <label>Pénalité saturation <input type="number" name="weights.saturation" step="0.05" /></label>
             <label>Bonus zones fertiles <input type="number" name="weights.fertile" step="0.05" /></label>
             <label>Bruit aléatoire <input type="number" name="weights.noise" step="0.01" /></label>
+            <label>Pénalité « même famille » (élément × son ingrédient) <input type="number" name="weights.family" step="0.05" /></label>
           </fieldset>
           <fieldset>
             <legend>Comportement</legend>

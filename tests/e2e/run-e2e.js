@@ -143,6 +143,24 @@ async function main() {
   check('Stop : état arrêté, plus aucune requête', s.state === 'idle' && server.total === totalAtStop, `${server.total - totalAtStop} requêtes après stop`);
   check('instances temporaires nettoyées après l’arrêt', (await game.evaluate(() => window.__mock.instances.length)) === 0);
 
+  // --- Arrêt / relance répétés (régression : la relance tournait au ralenti) ---
+  const restartRates = [];
+  for (let cyc = 0; cyc < 3; cyc++) {
+    await panel.click('#btn-start');
+    const t0 = server.total;
+    await sleep(3000);
+    restartRates.push(server.total - t0);
+    await panel.click('#btn-stop');
+    await sleep(300);
+  }
+  s = await snap();
+  check('arrêt / relance ×3 : débit rétabli à chaque relance', restartRates.every((n) => n >= 10), restartRates.join(', ') + ' requêtes en 3 s');
+  check('arrêt / relance : délai revenu au plancher du niveau', s.delayMs <= s.levelInfo.delayMs * 2, s.delayMs + ' ms');
+  const dup0 = [...server.perKey.values()].filter((n) => n > 1).length;
+  check('arrêt / relance : aucune paire envoyée deux fois', dup0 === 0, dup0 + ' doublons');
+  await sleep(2000);
+  check('arrêt / relance : aucune instance oubliée', (await game.evaluate(() => window.__mock.instances.length)) === 0);
+
   // --- Persistance + reprise après rechargement ---
   const pairsBefore = s.pairsTested;
   await panel.click('#btn-start');
@@ -162,7 +180,38 @@ async function main() {
   const dup2 = [...server.perKey.entries()].filter(([k, n]) => n > 1 && !lostOnReload.includes(k)).length;
   check('aucune paire retestée après rechargement', dup2 === 0, `${dup2} doublons (${lostOnReload.length} requête(s) perdue(s) pendant le rechargement)`);
   await panel.click('#btn-stop');
-  await sleep(500);
+  await sleep(1000);
+
+  // --- One object : un objet fusionné avec chaque élément possédé ---
+  await panel.fill('#focus-input', 'fir');
+  await sleep(600);
+  const options = await panel.evaluate(() => [...document.querySelectorAll('#focus-list option')].map((o) => o.value));
+  check('One object : recherche d’éléments possédés', options.includes('Fire'), options.slice(0, 5).join(', '));
+  await panel.fill('#focus-input', 'Fire');
+  const perKeyBefore = new Map(server.perKey);
+  await panel.click('#btn-focus');
+  await game.waitForFunction(() => window.ICX.engine.lastFocus && window.ICX.engine.lastFocus.finished, null, { timeout: 90000 });
+  s = await snap();
+  const missing = await game.evaluate(() => {
+    const E = window.ICX.engine;
+    const pk = window.ICX.pairkey;
+    const pl = E.planner.local;
+    return [...E.elements.values()].filter((e) => e.owned !== false && !pl.isExcluded(e) && !E.pairs.has(pk.pairKey('Fire', e.text))).map((e) => e.text);
+  });
+  check('One object : Fire fusionné avec chaque élément possédé', missing.length === 0 && s.lastFocus.done === s.lastFocus.total, `${s.lastFocus.done}/${s.lastFocus.total}, manquants : ${missing.slice(0, 5).join(', ')}`);
+  const nonFocus = [...server.perKey.keys()].filter((k) => !perKeyBefore.has(k) && !k.split('|').includes('fire'));
+  check('One object : aucune autre paire envoyée pendant l’opération', nonFocus.length === 0, nonFocus.length + ' autres');
+  // (une requête perdue pendant le rechargement plus haut est légitimement renvoyée)
+  const dupF = [...server.perKey.entries()].filter(([k, n]) => n > 1 && !lostOnReload.includes(k)).length;
+  if (process.env.ICX_DEBUG) {
+    console.log('DUP', JSON.stringify([...server.perKey.entries()].filter(([, n]) => n > 1)), 'LOST', JSON.stringify(lostOnReload));
+    console.log(await game.evaluate(() => ({ logs: window.ICX.engine.logs, reserved: [...window.ICX.engine.planner.local.reserved].filter((k) => k.includes('fire')), stats: window.ICX.engine.stats })));
+  }
+  check('One object : aucune paire déjà connue renvoyée', dupF === 0, dupF + ' doublons');
+  check('One object : arrêt automatique à la fin', s.state === 'idle', s.state);
+  await sleep(1500); // rafraîchissement du panneau (1 Hz en MAX)
+  const focusText = await panel.evaluate(() => document.querySelector('#focus-text').textContent);
+  check('One object : progression affichée dans le side panel', /terminé/.test(focusText), focusText);
 
   // --- Backend fetch + materializer (ajout à l'inventaire par l'extension) ---
   await game.evaluate(() => window.ICX.engine.setSettings({ backend: 'fetch' }));

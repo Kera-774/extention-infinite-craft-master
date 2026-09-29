@@ -131,6 +131,8 @@ function render(s) {
     })
   );
 
+  renderFocus(s.focus, s.lastFocus);
+
   const w = [];
   if (s.cooling) w.push({ text: 'Pause de refroidissement en cours…' });
   if (s.needsReload) w.push({ text: 'Certains éléments n’ont pas pu être ajoutés à chaud : rechargez le jeu pour les voir.', action: 'reload' });
@@ -157,6 +159,72 @@ function showWarnings(list) {
     })
   );
 }
+
+/** Exécute une action du panneau et affiche l'état renvoyé (ou l'erreur). */
+const act = (fn) => async () => {
+  try {
+    const r = await fn();
+    if (r && r.state) render(r);
+  } catch (err) {
+    alert(err.message);
+  }
+};
+
+// --- One object ---------------------------------------------------------------
+function renderFocus(f, last) {
+  const active = !!f;
+  $('btn-focus-cancel').hidden = !active;
+  $('btn-focus').disabled = active;
+  const show = f || last;
+  $('focus-status').hidden = !show;
+  if (!show) return;
+  const pct = show.total ? Math.round((100 * show.done) / show.total) : 0;
+  $('focus-bar').style.width = pct + '%';
+  const head = `${show.emoji || ''} ${show.text} : ${fmt(show.done)} / ${fmt(show.total)} éléments (${pct} %)`;
+  const tail = ` — ${fmt(show.newCount)} nouveaux, ${fmt(show.firstCount)} premières découvertes, ${fmt(show.fails)} « Nothing »`;
+  const status = active ? '' : last.finished ? ' — terminé ✔' : last.cancelled ? ' — annulé' : '';
+  $('focus-text').textContent = head + tail + status;
+  $('focus-found').replaceChildren(
+    ...show.found.slice(0, 20).map((r) => {
+      const li = document.createElement('li');
+      const name = document.createElement('span');
+      name.textContent = `${r.emoji || ''} ${r.text}${r.isNew ? ' ★' : ''}`;
+      if (r.isNew) name.className = 'first';
+      const from = document.createElement('span');
+      from.className = 'from';
+      from.textContent = `  ← + ${r.partner}`;
+      li.append(name, from);
+      return li;
+    })
+  );
+}
+
+let searchTimer = null;
+$('focus-input').addEventListener('input', () => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(async () => {
+    try {
+      const list = await send('searchElements', { q: $('focus-input').value, limit: 40 });
+      $('focus-list').replaceChildren(
+        ...list.map((e) => {
+          const o = document.createElement('option');
+          o.value = e.text;
+          o.label = `${e.emoji || ''} ${e.text}`;
+          return o;
+        })
+      );
+    } catch (_) {
+      /* onglet pas prêt */
+    }
+  }, 150);
+});
+
+$('btn-focus').onclick = act(() => {
+  const target = $('focus-input').value.trim();
+  if (!target) throw new Error('Choisissez d’abord un objet.');
+  return send('startFocus', { target, thenExplore: $('focus-then').checked });
+});
+$('btn-focus-cancel').onclick = act(() => send('cancelFocus'));
 
 // --- Réglages ----------------------------------------------------------------
 function getPath(obj, path) {
@@ -201,14 +269,6 @@ function readSettings() {
 }
 
 // --- Événements UI -----------------------------------------------------------
-const act = (fn) => async () => {
-  try {
-    const r = await fn();
-    if (r && r.state) render(r);
-  } catch (err) {
-    alert(err.message);
-  }
-};
 
 $('btn-start').onclick = act(() => send('start'));
 $('btn-pause').onclick = act(() => send('pause'));

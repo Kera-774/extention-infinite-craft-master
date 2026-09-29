@@ -20,7 +20,7 @@
       this.workerError = null;
       this.suspended = 0; // workers suspendus par le garde-fou thermique
       this.targetWorkers = 0;
-      this.delta = { upsert: new Map(), tested: [], reserve: [], unreserve: [] };
+      this._resetDelta();
       this.reqSeq = 0;
       this.waiters = new Map();
     }
@@ -55,6 +55,7 @@
       while (this.workers.length > want) {
         const { w } = this.workers.pop();
         w.terminate();
+        this._failWaiters(w, 'worker arrêté');
       }
       if (!this.workerSource || this.workerError) return;
       while (this.workers.length < want) {
@@ -87,6 +88,7 @@
         console.warn('[ICX]', this.workerError);
         for (const [, cb] of this.waiters) cb.reject(new Error(this.workerError));
         this.waiters.clear();
+        for (const x of this.workers) clearTimeout(x.timer);
         this.targetWorkers = 0;
         this._reconcile();
       };
@@ -102,6 +104,16 @@
       return w;
     }
 
+    /** Rejette les demandes en attente d'un worker terminé (sinon la génération resterait bloquée). */
+    _failWaiters(w, reason) {
+      for (const [id, cb] of this.waiters) {
+        if (cb.worker !== w) continue;
+        this.waiters.delete(id);
+        clearTimeout(cb.timer);
+        cb.reject(new Error(reason));
+      }
+    }
+
     // --- mutations : appliquées localement et bufferisées pour les workers ---
     upsertElement(e) {
       this.local.upsertElement(e);
@@ -111,28 +123,43 @@
       this.local.markTested(key);
       if (this.workers.length) this.delta.tested.push(key);
     }
+    // Réservations : état NET par clé (la dernière opération gagne). Envoyer
+    // « toutes les libérations puis toutes les réservations » laissait réservée
+    // à jamais une paire réservée puis libérée dans le même lot (ex. file vidée
+    // par un Stop) : le worker ne la proposait plus jamais.
     reserve(key) {
       this.local.reserve(key);
-      if (this.workers.length) this.delta.reserve.push(key);
+      if (this.workers.length) this.delta.res.set(key, true);
     }
     unreserve(key) {
       this.local.unreserve(key);
-      if (this.workers.length) this.delta.unreserve.push(key);
+      if (this.workers.length) this.delta.res.set(key, false);
+    }
+    /** Libère toutes les réservations (file et requêtes en vol vides : elles sont périmées). */
+    releaseAll() {
+      for (const k of [...this.local.reserved]) this.unreserve(k);
     }
     setConfig(c) {
       this.local.setConfig(c);
       for (const { w } of this.workers) w.postMessage({ type: 'config', config: c });
     }
 
+    _resetDelta() {
+      this.delta = { upsert: new Map(), tested: [], res: new Map() };
+    }
+
     _flushDelta() {
       const d = this.delta;
       const msgs = [];
+      const reserve = [];
+      const unreserve = [];
+      for (const [k, on] of d.res) (on ? reserve : unreserve).push(k);
       if (d.upsert.size) msgs.push({ type: 'upsert', elements: [...d.upsert.values()] });
-      if (d.tested.length) msgs.push({ type: 'tested', keys: d.tested });
-      if (d.unreserve.length) msgs.push({ type: 'unreserve', keys: d.unreserve });
-      if (d.reserve.length) msgs.push({ type: 'reserve', keys: d.reserve });
+      if (unreserve.length) msgs.push({ type: 'unreserve', keys: unreserve });
+      if (reserve.length) msgs.push({ type: 'reserve', keys: reserve });
+      if (d.tested.length) msgs.push({ type: 'tested', keys: d.tested }); // en dernier : « testé » l'emporte
       for (const { w } of this.workers) for (const m of msgs) w.postMessage(m);
-      this.delta = { upsert: new Map(), tested: [], reserve: [], unreserve: [] };
+      this._resetDelta();
     }
 
     /** Génère des candidats (worker(s) si disponibles, sinon local). */
@@ -149,7 +176,13 @@
             o.limit = Math.ceil((opts.limit || 2000) / n);
           }
           return new Promise((resolve, reject) => {
-            this.waiters.set(reqId, { resolve, reject });
+            // délai de garde : un worker figé ne doit jamais bloquer la boucle
+            const timer = setTimeout(() => {
+              this.waiters.delete(reqId);
+              reject(new Error('worker trop lent'));
+            }, 8000);
+            const done = (fn) => (v) => (clearTimeout(timer), fn(v));
+            this.waiters.set(reqId, { resolve: done(resolve), reject: done(reject), worker: w, timer });
             w.postMessage({ type: 'generate', reqId, opts: o, worker: i });
           });
         })

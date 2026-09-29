@@ -89,3 +89,17 @@ test('configure à chaud conserve l’état en le bornant', () => {
   a.configure({ min: 4, max: 12 });
   assert.equal(a.limit, 6); // pas de saut brutal
 });
+
+test('relance après arrêt : le backoff transitoire est oublié, l’apprentissage gardé', () => {
+  const a = new Aimd({ min: 4, max: 12, initial: 10, baseDelayMs: 80, cooldownMs: 0 });
+  a.onRateLimit(1000, 60000); // gros Retry-After, délai doublé
+  const cw = a.limit;
+  const ceiling = a.ceiling;
+  a.resetTransient(2000);
+  assert.equal(a.delayMs, 80);
+  assert.equal(a.limit, cw);
+  assert.equal(a.ceiling, ceiling);
+  assert.equal(a.pausedUntil, 61000); // un Retry-After encore valide est respecté
+  a.resetTransient(70000);
+  assert.equal(a.waitMs(70000, 0), 0);
+});

@@ -14,6 +14,21 @@ Chrome 116 ou plus récent est requis (content scripts `world: "MAIN"` et side p
 
 > Premier lancement conseillé : exportez votre partie avec l'export intégré au jeu, puis lancez 2 à 3 minutes en **ÉCO** et vérifiez que les nouveaux éléments apparaissent dans l'inventaire.
 
+## Nouveautés de la v1.1
+
+- **Arrêt / relance corrigés.** Trois causes rendaient la relance lente, ou la bloquaient :
+  1. le délai de backoff gonflé par d'anciens 429 était conservé après l'arrêt. Il est maintenant remis au plancher du niveau à chaque relance ; la concurrence et le plafond appris sur le serveur sont conservés ;
+  2. une génération confiée à un worker terminé entre-temps (changement de niveau, garde-fou thermique) n'aboutissait jamais. Chaque demande a désormais un délai de garde de 8 s, avec repli sur le calcul local ;
+  3. au Stop, les instances temporaires étaient retirées pendant que le jeu fusionnait encore. Elles sont maintenant retirées **à la fin** de la fusion.
+
+  Une relance demandée pendant l'écriture de l'arrêt attend la fin de celui-ci.
+- **Bug corrigé : des paires étaient perdues définitivement.** Une paire réservée puis libérée dans le même lot restait réservée à jamais côté worker, qui ne la proposait plus. L'état est désormais transmis net, clé par clé. Filet de sécurité : si la file et les requêtes en vol sont vides, toute réservation restante est libérée.
+- **Mode « One object »** : voir la section 3 bis.
+- **Efficacité** :
+  - nouvelle pénalité « même famille » : fusionner un élément avec l'un de ses propres ingrédients redonne souvent un élément déjà connu (poids réglable) ;
+  - recherche des éléments du jeu en O(1) grâce à un index, au lieu de deux parcours complets de l'inventaire par requête ;
+  - horloge de la boucle confiée à un Web Worker, moins bridé par Chrome quand l'onglet est en arrière-plan (repli automatique sur `setTimeout`).
+
 ---
 
 ## 0. Investigation : ce qui diffère de vos hypothèses
@@ -119,6 +134,7 @@ Pour une ancre donnée, les meilleurs partenaires sont donc simplement les élé
 | Pénalité saturation | ≥ 10 essais et rendement récent < 4 % | `saturation` 0.6 |
 | Bonus zone fertile | `min(1, 0,5·isNew produits + 2·rendement récent)` | `fertile` 0.6 |
 | Liste blanche | bonus fixe | 3.0 |
+| Même famille (terme de paire) | pénalité si l'un est un ingrédient direct de l'autre | `family` 0.3 |
 | Bruit | uniforme `[0, 0.08)` par paire | `noise` 0.08 |
 
 **Déroulement de la boucle :**
@@ -133,6 +149,23 @@ Pour une ancre donnée, les meilleurs partenaires sont donc simplement les élé
 - **Deux compteurs distincts :** les **nouveaux éléments** (nouveaux pour vous) et les **premières découvertes** (`isNew`/`discovery`, marquées ★ dans le panneau).
 
 Tous les poids et seuils se règlent dans l'interface.
+
+## 3 bis. Mode « One object »
+
+Dans le side panel, section **One object** :
+
+1. Tapez quelques lettres : la liste propose vos éléments possédés.
+2. Choisissez un objet, puis cliquez sur **Fusionner avec tout**.
+
+L'objet est alors fusionné avec **chaque élément découvert** :
+
+- **Ordre :** les partenaires les plus prometteurs d'abord (même classement que l'exploration), puis tous les autres, sans limite de parcours.
+- **Nouveaux éléments :** ceux découverts pendant l'opération, y compris par ces fusions mêmes, sont ajoutés à la liste des partenaires.
+- **Déjà connu :** les paires déjà connues (succès ou « Nothing ») ne sont **jamais** renvoyées. Relancer le même objet plus tard ne teste donc que les nouveaux éléments.
+- **Exclusions :** les éléments en liste noire, non possédés, ou au nom trop long sont exclus. L'objet choisi est accepté même s'il est lui-même dans l'un de ces cas.
+- **Pendant l'opération :** seules les paires contenant l'objet sont envoyées. Le niveau de puissance, l'AIMD et les garde-fous s'appliquent normalement.
+- **Suivi :** une barre de progression indique les éléments traités sur le total, les nouveaux éléments, les premières découvertes (★) et les « Nothing ». La liste des découvertes affiche le partenaire utilisé.
+- **À la fin :** arrêt automatique ou, si la case est cochée, reprise de l'exploration normale. Le bouton **Annuler** revient à l'exploration normale sans arrêter.
 
 ## 4. Niveaux de puissance
 
@@ -194,19 +227,22 @@ npm test          # tests unitaires : clé de paire, tas, AIMD (dont convergence
 npm run test:e2e  # Chromium + extension chargée + maquette du jeu (Playwright requis)
 ```
 
-**Tests unitaires : 26 sur 26 passent.** Ils couvrent :
+**Tests unitaires : 29 sur 29 passent.** Ils couvrent :
 
 - la commutativité et l'échappement de la clé de paire ;
 - l'ordre du tas, `trimTo` et la ré-insertion ;
 - l'AIMD : montée, baisse sur 429, fenêtre de refroidissement, `Retry-After`, **convergence vers le plafond d'un serveur simulé**, changement de niveau à chaud ;
-- le planificateur : exactement N(N+1)/2 paires, aucune paire connue ou réservée proposée, génération incrémentale, exclusions, ordre des scores, bonus UCB.
+- la remise à zéro du backoff à la relance ;
+- le planificateur : exactement N(N+1)/2 paires, aucune paire connue ou réservée proposée, génération incrémentale, exclusions, ordre des scores, bonus UCB, ancre forcée sans limite de parcours (One object), pénalité « même famille ».
 
-**Test de bout en bout : 31 vérifications sur 31 passent.** Il charge l'extension non empaquetée dans Chromium. La page `https://neal.fun/infinite-craft/` et l'API `/pair` sont interceptées par Playwright, qui sert une **maquette** du jeu. Il vérifie :
+**Test de bout en bout : 41 vérifications sur 41 passent.** Il charge l'extension non empaquetée dans Chromium. La page `https://neal.fun/infinite-craft/` et l'API `/pair` sont interceptées par Playwright, qui sert une **maquette** du jeu. Il vérifie :
 
 - le démarrage depuis le side panel et la découverte d'éléments, ajoutés à l'inventaire par le jeu ;
 - que **aucune paire n'est envoyée deux fois** ;
 - le passage de NORMAL à MAX à chaud, et la réaction de l'AIMD aux 429 ;
 - les workers, le Stop instantané et le nettoyage des instances ;
+- **trois cycles arrêt/relance** : débit rétabli à chaque relance, délai revenu au plancher, aucun doublon, aucune instance oubliée ;
+- **One object** : recherche, fusion de l'objet avec chaque élément possédé, aucune autre paire envoyée, aucun doublon, arrêt automatique, progression affichée ;
 - la **reprise après rechargement sans aucune paire retestée** ;
 - la méthode `fetch` : ajout dans la mémoire du jeu et dans IndexedDB, avec sauvegarde de secours ;
 - l'export et l'import ;
@@ -224,6 +260,8 @@ Le site est inaccessible depuis l'environnement de développement. Les tests de 
 6. **Limites réelles du serveur** : l'AIMD s'y adapte, mais les délais plancher de TURBO et MAX peuvent mériter un ajustement.
 7. **La règle « plus de 30 caractères → Nothing »** vient de la réimplémentation communautaire. Si elle est fausse, montez « Longueur max. des noms » dans les réglages.
 8. **L'ouverture du side panel par l'icône.** En test, le panneau a été ouvert comme page d'extension.
+9. **Le gain de l'horloge en worker** pour un onglet en arrière-plan : Chromium headless ne bride pas les onglets cachés, donc ce gain n'a pas pu être mesuré.
+10. **L'effet réel de la pénalité « même famille »** sur le rendement. La maquette produit des recettes aléatoires ; le poids (0.3) est une estimation, réglable dans les réglages.
 
 Si quelque chose ne fonctionne pas, le **Journal** du panneau et la console de l'onglet du jeu (préfixe `[ICX]`) indiquent la méthode utilisée et les erreurs.
 

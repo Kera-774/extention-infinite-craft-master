@@ -32,6 +32,7 @@
     fertile: 0.6, // bonus zones fertiles (isNew, bon rendement récent)
     whitelist: 3.0, // bonus liste blanche
     selfPair: 0.05, // léger bonus auto-fusion
+    family: 0.3, // pénalité : élément × l'un de ses propres ingrédients (redonne souvent du connu)
     noise: 0.08 // bruit aléatoire (anti-boucle déterministe)
   };
 
@@ -220,9 +221,14 @@
       return 0.5 * (va + vb) + (self ? this.weights.selfPair : 0) + this.rand() * this.weights.noise;
     }
 
+    /** Vrai si l'un des deux éléments est un ingrédient direct de l'autre. */
+    related(ea, eb) {
+      return !!((ea.parents && ea.parents.includes(eb.id)) || (eb.parents && eb.parents.includes(ea.id)));
+    }
+
     pairScore(ea, eb) {
       if (!ea || !eb || this.isExcluded(ea) || this.isExcluded(eb)) return -Infinity;
-      return this.pairScoreFromValues(this.elementValue(ea), this.elementValue(eb), ea.id === eb.id);
+      return this.pairScoreFromValues(this.elementValue(ea), this.elementValue(eb), ea.id === eb.id) - (this.related(ea, eb) ? this.weights.family : 0);
     }
 
     /**
@@ -232,12 +238,14 @@
      * @param {number} [o.anchorCount=32] nb d'ancres si non imposées
      * @param {number} [o.perAnchor=64]  paires max par ancre
      * @param {number} [o.limit=2000]    paires max au total
+     * @param {boolean} [o.forceAnchors] ancres utilisées même exclues / « épuisées » (One object)
+     * @param {number} [o.maxScan]       borne de parcours par ancre (Infinity = tous les partenaires)
      * @returns {{a:string,b:string,key:string,score:number}[]}
      */
     generate(o = {}) {
       const perAnchor = o.perAnchor ?? 64;
       const limit = o.limit ?? 2000;
-      const maxScan = this.settings.maxScanPerAnchor;
+      const maxScan = o.maxScan ?? this.settings.maxScanPerAnchor;
 
       // Classement de tous les éléments éligibles par valeur décroissante
       const ranked = [];
@@ -255,7 +263,8 @@
       const anchors = [];
       const seen = new Set();
       const addAnchor = (e) => {
-        if (!e || seen.has(e.id) || this.isExcluded(e) || exhausted(e)) return;
+        if (!e || seen.has(e.id)) return;
+        if (!o.forceAnchors && (this.isExcluded(e) || exhausted(e))) return;
         seen.add(e.id);
         anchors.push(e);
       };
@@ -281,7 +290,7 @@
       const emitted = new Set();
       for (const anc of anchors) {
         if (out.length >= limit) break;
-        const va = valueOf.get(anc.id);
+        const va = valueOf.has(anc.id) ? valueOf.get(anc.id) : this.elementValue(anc);
         let taken = 0;
         let scanned = 0;
         for (let i = 0; i < N && taken < perAnchor && scanned < maxScan; i++) {
@@ -291,7 +300,8 @@
           if (this.tested.has(key) || this.reserved.has(key) || emitted.has(key)) continue;
           emitted.add(key);
           const [a, b] = pk.orderPair(anc.text, p.text);
-          out.push({ a, b, key, score: this.pairScoreFromValues(va, ranked[i].v, anc.id === p.id) });
+          const fam = this.related(anc, p) ? this.weights.family : 0;
+          out.push({ a, b, key, score: this.pairScoreFromValues(va, ranked[i].v, anc.id === p.id) - fam });
           taken++;
           if (out.length >= limit) break;
         }

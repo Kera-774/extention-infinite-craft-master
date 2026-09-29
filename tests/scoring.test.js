@@ -92,3 +92,27 @@ test('Thompson sampling produit des valeurs finies', () => {
   base(p);
   for (const e of p.elements.values()) assert.ok(Number.isFinite(p.elementValue(e)));
 });
+
+test('One object : ancre forcée, tous les partenaires parcourus sans limite', () => {
+  const p = new Planner({ seed: 9, settings: { maxScanPerAnchor: 3 }, blacklist: ['Target'] });
+  base(p);
+  p.upsertElement(makeElement('Target', '', 1, 1));
+  for (let i = 0; i < 20; i++) p.upsertElement(makeElement('E' + i, '', 2, 2 + i));
+  // sans forçage : l'ancre en liste noire est ignorée, et le parcours est borné à 3
+  assert.equal(p.generate({ anchors: ['target'], perAnchor: 100 }).length, 0);
+  const list = p.generate({ anchors: ['target'], forceAnchors: true, perAnchor: 100, maxScan: Infinity });
+  assert.equal(list.length, 24); // 4 de base + 20 (la cible elle-même est en liste noire comme partenaire)
+  assert.ok(list.every((c) => c.key.split('|').includes('target')));
+});
+
+test('pénalité « même famille » : élément × son propre ingrédient', () => {
+  const p = new Planner({ seed: 10, weights: { noise: 0 } });
+  base(p);
+  p.upsertElement({ ...makeElement('Steam', '', 1, 1), parents: ['water', 'fire'] });
+  const steam = p.elements.get('steam');
+  assert.ok(p.related(steam, p.elements.get('water')));
+  assert.ok(!p.related(steam, p.elements.get('earth')));
+  const withParent = p.pairScore(steam, p.elements.get('water'));
+  const withOther = p.pairScore(steam, p.elements.get('earth'));
+  assert.ok(withOther - withParent > 0.25);
+});

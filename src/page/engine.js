@@ -136,7 +136,16 @@
         this.planner.upsertElement(cur ? { ...cur, depth: 0, owned: true } : makeElement(b.text, b.emoji, 0, 0));
       }
 
-      // 3) profondeurs à partir des recettes du jeu (relaxation type Bellman-Ford)
+      // 3a) parents (première recette connue) : sert à la pénalité « même famille »
+      for (const it of items) {
+        if (!Array.isArray(it.recipes) || !it.recipes.length) continue;
+        const e = this.elements.get(pk.normName(it.text));
+        const A = byGameId.get(it.recipes[0] && it.recipes[0][0]);
+        const B = byGameId.get(it.recipes[0] && it.recipes[0][1]);
+        if (e && A && B && !e.parents) e.parents = [pk.normName(A.text), pk.normName(B.text)];
+      }
+
+      // 3b) profondeurs à partir des recettes du jeu (relaxation type Bellman-Ford)
       this._computeDepths(items, byGameId);
 
       // 4) paires déjà connues : cache + recettes de la sauvegarde du jeu (jamais retestées)
@@ -283,18 +292,31 @@
 
     start() {
       if (this.state === 'running' || this.state === 'init') return;
+      // un arrêt encore en cours d'écriture : on relance juste après lui
+      if (this.stopping) {
+        this.stopping.then(() => this.start());
+        return;
+      }
+      const now = Date.now();
       this.backend = this.resolveBackend();
+      // relance propre : on oublie le backoff et les compteurs transitoires de la
+      // session précédente (sinon un délai gonflé par des 429 anciens ralentissait tout)
+      this.aimd.resetTransient(now);
+      this.guard.resetCooldown(now);
+      this.consecutiveErrors = this.forbiddenStreak = this.invalidStreak = 0;
+      this.emptyRefills = 0;
+      this.lastStart = 0;
       this.state = 'running';
       this.store.setMeta('running', true);
       this.store.flush();
-      this.log(`Démarrage — niveau ${this.L.label}, backend ${this.backend}`);
+      this.log(`Démarrage — niveau ${this.L.label}, méthode ${this.backend}` + (this.focus ? `, One object : ${this.focus.text}` : ''));
       this.scheduleTick(0);
     }
 
     pause() {
       if (this.state !== 'running') return;
       this.state = 'paused';
-      clearTimeout(this.tickTimer);
+      ICX.clock.clear(this.tickTimer);
       this.store.setMeta('running', false);
       this.store.flush();
       this.log('Pause (les requêtes en cours se terminent)');
@@ -303,17 +325,112 @@
     /** Arrêt instantané : annule les requêtes en vol, vide la file, sauvegarde. */
     async stop() {
       if (this.state === 'init') return;
+      if (this.stopping) return this.stopping;
       this.state = 'idle';
-      clearTimeout(this.tickTimer);
+      ICX.clock.clear(this.tickTimer);
       for (const { ctrl } of this.inflight.values()) ctrl.abort();
+      this.inflight.clear(); // les réponses tardives seront quand même mémorisées (onExternal)
+      this._clearQueue();
+      // pendingAnchors est conservé : à la relance, les nouveaux éléments restent prioritaires
+      this.store.setMeta('running', false);
+      this.stopping = (async () => {
+        try {
+          // les instances temporaires encore en fusion sont retirées par le jeu dès
+          // la fin de leur fusion (voir craftGame) : rien à arracher ici
+          await Promise.all([this.store.flush(), this.game.flushMaterialize()]);
+          this.log('Arrêté, progression sauvegardée');
+        } finally {
+          this.stopping = null;
+        }
+      })();
+      await this.stopping;
+      if (this.state === 'idle' && this.game.needsReload && this.settings.reloadOnStop) this.game.reloadGame();
+    }
+
+    _clearQueue() {
       for (const c of this.heap.toArray()) this.planner.unreserve(c.key);
       this.heap.clear();
-      this.pendingAnchors.clear();
-      this.store.setMeta('running', false);
-      await Promise.all([this.store.flush(), this.game.flushMaterialize()]);
-      this.game.sweepInstances();
-      this.log('Arrêté, progression sauvegardée');
-      if (this.game.needsReload && this.settings.reloadOnStop) this.game.reloadGame();
+    }
+
+    // ------------------------------------------------------------------
+    // Mode « One object » : un objet choisi fusionné avec chaque élément possédé
+    // ------------------------------------------------------------------
+    startFocus(text, thenExplore) {
+      if (this.state === 'init') throw new Error('moteur pas encore prêt');
+      const id = pk.normName(text);
+      const e = this.elements.get(id);
+      if (!e || e.owned === false) throw new Error('élément non possédé : ' + text);
+      this._clearQueue();
+      this.focus = {
+        id,
+        text: e.text,
+        emoji: e.emoji,
+        thenExplore: !!thenExplore,
+        startedAt: Date.now(),
+        requests: 0,
+        newCount: 0,
+        firstCount: 0,
+        fails: 0,
+        found: []
+      };
+      this.log(`One object : ${e.text} × chaque élément possédé`);
+      if (this.state === 'running') this.scheduleTick(0);
+      else this.start();
+    }
+
+    cancelFocus() {
+      if (!this.focus) return;
+      this.log(`One object annulé (${this.focus.text})`);
+      this.lastFocus = { ...this.focusSnapshot(), cancelled: true };
+      this.focus = null;
+      this._clearQueue();
+      if (this.state === 'running') this.scheduleTick(0);
+    }
+
+    _finishFocus() {
+      const f = this.focusSnapshot();
+      this.log(`One object terminé : ${f.text} fusionné avec ${f.done} éléments → ${f.newCount} nouveaux, ${f.firstCount} premières découvertes`);
+      this.lastFocus = { ...f, finished: true };
+      const then = this.focus.thenExplore;
+      this.focus = null;
+      if (then) this.scheduleTick(0);
+      else this.stop();
+    }
+
+    /** Progression : partenaires éligibles déjà fusionnés avec l'objet / total. */
+    focusSnapshot() {
+      const f = this.focus;
+      if (!f) return null;
+      const pl = this.planner.local;
+      let total = 0;
+      let done = 0;
+      for (const e of this.elements.values()) {
+        if (e.id !== f.id && pl.isExcluded(e)) continue;
+        total++;
+        if (this.pairs.has(pk.pairKey(f.text, e.text))) done++;
+      }
+      return { text: f.text, emoji: f.emoji, done, total, requests: f.requests, newCount: f.newCount, firstCount: f.firstCount, fails: f.fails, thenExplore: f.thenExplore, found: f.found.slice(0, 30) };
+    }
+
+    /** Recherche d'éléments possédés (sélecteur du side panel). */
+    searchElements(q, limit = 40) {
+      const n = pk.normName(q || '');
+      const exact = [];
+      const prefix = [];
+      const contains = [];
+      for (const e of this.elements.values()) {
+        if (e.owned === false) continue;
+        if (!n) prefix.push(e);
+        else if (e.id === n) exact.push(e);
+        else if (e.id.startsWith(n)) prefix.push(e);
+        else if (e.id.includes(n)) contains.push(e);
+        if (!n && prefix.length >= limit) break;
+      }
+      const byLen = (a, b) => a.text.length - b.text.length;
+      return exact
+        .concat(prefix.sort(byLen), contains.sort(byLen))
+        .slice(0, limit)
+        .map((e) => ({ text: e.text, emoji: e.emoji }));
     }
 
     setLevel(level) {
@@ -340,8 +457,8 @@
     // Boucle
     // ------------------------------------------------------------------
     scheduleTick(ms) {
-      clearTimeout(this.tickTimer);
-      this.tickTimer = setTimeout(() => this.tick(), ms);
+      ICX.clock.clear(this.tickTimer);
+      this.tickTimer = ICX.clock.set(() => this.tick(), ms);
     }
 
     tick() {
@@ -352,7 +469,7 @@
       const wait = this.aimd.waitMs(now, this.lastStart);
       if (wait > 0) return this.scheduleTick(wait);
 
-      if (this.heap.size < this.L.lookahead / 2 || this.pendingAnchors.size) this.refill();
+      if (this.heap.size < this.L.lookahead / 2 || (!this.focus && this.pendingAnchors.size)) this.refill();
       // Rythme par jetons : si le timer s'est réveillé en retard (onglet en arrière-plan,
       // où Chrome regroupe les timers à 1 réveil/s), on rattrape en lançant plusieurs
       // requêtes d'un coup, sans jamais dépasser la concurrence autorisée.
@@ -381,6 +498,13 @@
         }
         // une requête en vol peut encore créer un élément : sa fin relancera le tick
         if (this.inflight.size > 0) return;
+        // file et requêtes en vol vides : toute réservation restante est périmée
+        // (filet de sécurité) → on la libère et on régénère avant de conclure
+        if (this.planner.local.reserved.size) {
+          this.planner.releaseAll();
+          return this.scheduleTick(0);
+        }
+        if (this.focus) return this._finishFocus();
         // ancres en partie aléatoires : on insiste un peu avant de conclure
         if (++this.emptyRefills < 3) return this.scheduleTick(200);
         this.log('Plus aucune paire candidate : exploration terminée pour les éléments autorisés');
@@ -396,6 +520,12 @@
         if (this.pairs.has(c.key) || this.inflight.has(c.key)) continue;
         const ea = this.elements.get(pk.normName(c.a));
         const eb = this.elements.get(pk.normName(c.b));
+        const inFocus = this.focus && ((ea && ea.id === this.focus.id) || (eb && eb.id === this.focus.id));
+        if (this.focus && !inFocus) {
+          this.planner.unreserve(c.key); // reste d'une file précédente
+          continue;
+        }
+        if (inFocus) return c; // ordre déjà fixé par la valeur du partenaire
         const s = pl.pairScore(ea, eb);
         if (s === -Infinity) {
           this.planner.unreserve(c.key);
@@ -418,7 +548,10 @@
       if (this.refilling) return this.refilling;
       const L = this.L;
       let opts;
-      if (this.pendingAnchors.size) {
+      if (this.focus) {
+        // tous les partenaires, meilleurs d'abord, sans limite de parcours
+        opts = { anchors: [this.focus.id], forceAnchors: true, perAnchor: L.lookahead, limit: L.lookahead, maxScan: Infinity };
+      } else if (this.pendingAnchors.size) {
         const anchors = [...this.pendingAnchors];
         this.pendingAnchors.clear();
         opts = { anchors, perAnchor: Math.max(24, Math.floor(L.lookahead / Math.max(4, anchors.length))), limit: L.lookahead };
@@ -520,6 +653,7 @@
       if (isNewForUs) {
         const seq = this.planner.local.seq + 1;
         const el = existing ? { ...existing, owned: true, born: seq, depth: Math.min(existing.depth, parentDepth) } : makeElement(r.text, r.emoji, parentDepth, seq);
+        if (!el.parents && ea && eb) el.parents = [ea.id, eb.id];
         this.planner.upsertElement(el);
         this.store.queueElement(this.elements.get(rid));
         this.pendingAnchors.add(rid); // génération incrémentale de ses paires
@@ -528,11 +662,33 @@
         this.recent.unshift({ text: r.text, emoji: r.emoji, isNew: !!r.isNew, a, b, t: now });
         if (this.recent.length > 30) this.recent.pop();
         if (materialize) this.game.queueMaterialize({ text: r.text, emoji: r.emoji, isNew: r.isNew, parentA: a, parentB: b });
+        // One object : le nouvel élément doit lui aussi être fusionné avec l'objet
+        if (this.focus && rid !== this.focus.id) {
+          const fk = pk.pairKey(this.focus.text, r.text);
+          if (!this.pairs.has(fk) && !this.planner.local.reserved.has(fk)) {
+            const [fa, fb] = pk.orderPair(this.focus.text, r.text);
+            this.planner.reserve(fk);
+            this.heap.push({ a: fa, b: fb, key: fk, score: 1e6 });
+          }
+        }
       } else if (existing && existing.depth > parentDepth) {
         this.planner.upsertElement({ ...existing, depth: parentDepth });
         this.store.queueElement(this.elements.get(rid));
       }
       for (const p of parents) if (p) (this.planner.upsertElement(p), this.store.queueElement(p));
+
+      const f = this.focus;
+      if (f && ((ea && ea.id === f.id) || (eb && eb.id === f.id))) {
+        f.requests++;
+        if (r.nothing) f.fails++;
+        if (isNewForUs) {
+          f.newCount++;
+          if (r.isNew) f.firstCount++;
+          const partner = ea && ea.id === f.id ? b : a;
+          f.found.unshift({ partner, text: r.text, emoji: r.emoji, isNew: !!r.isNew });
+          if (f.found.length > 50) f.found.pop();
+        }
+      }
 
       this._updateMode(reward);
     }
@@ -708,6 +864,8 @@
         battery: b ? { level: b.level, charging: b.charging } : null,
         cooling: now < this.guard.coolingUntil,
         recent: this.recent.slice(0, 20),
+        focus: this.focusSnapshot(),
+        lastFocus: this.lastFocus || null,
         logs: this.logs.slice(0, 12),
         storage: this.storageName,
         storeError: this.store.lastError,

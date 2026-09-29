@@ -111,6 +111,18 @@
       return true;
     }
 
+    /**
+     * Relance après un arrêt : on oublie le backoff transitoire (délai gonflé,
+     * pause Retry-After, fenêtre de refroidissement) mais on garde ce qui a été
+     * appris sur le serveur (concurrence courante et plafond mémorisé).
+     */
+    resetTransient(now = 0) {
+      this.delayMs = this.baseDelayMs;
+      if (this.pausedUntil < now) this.pausedUntil = 0;
+      this.lastDecrease = -Infinity;
+      this.cwnd = Math.min(this.max, Math.max(this.min, this.cwnd));
+    }
+
     /** Réduit d'un cran (garde-fou thermique) sans toucher au délai. */
     stepDown() {
       this.cwnd = Math.max(this.min, this.cwnd - 1);

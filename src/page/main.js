@@ -37,6 +37,14 @@
         return engine.importCache(p);
       case 'clearCache':
         return engine.clearCache();
+      case 'startFocus':
+        engine.startFocus(p.target, p.thenExplore);
+        return engine.snapshot();
+      case 'cancelFocus':
+        engine.cancelFocus();
+        return engine.snapshot();
+      case 'searchElements':
+        return engine.searchElements(p.q, p.limit);
       case 'reloadGame':
         await engine.stop();
         engine.game.reloadGame();

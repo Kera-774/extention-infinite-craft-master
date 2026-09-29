@@ -129,6 +129,12 @@
       }
     }
 
+    /** Relance : le compteur de refroidissement repart de zéro. */
+    resetCooldown(now) {
+      this.runningSince = now;
+      this.coolingUntil = 0;
+    }
+
     /** Appelé par le moteur à chaque tick en niveau MAX. Renvoie true si en pause. */
     cooling(now, level) {
       if (!this.cooldownEnabled || !LEVELS[level] || !LEVELS[level].cooldown) {

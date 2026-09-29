@@ -194,11 +194,24 @@
       return BASE.map((b, i) => ({ id: i, ...b }));
     }
 
+    /**
+     * Recherche par nom en O(1) : index reconstruit seulement quand l'inventaire
+     * change (nouveau tableau ou nouvelle longueur), au lieu d'un parcours
+     * complet de l'inventaire à chaque requête.
+     */
     findItem(text) {
-      const n = pk.normName(text);
       const items = this.getItems();
-      for (const it of items) if (pk.normName(it.text) === n) return it;
-      return null;
+      if (items !== this._idxSrc || items.length !== this._idxLen) {
+        const idx = new Map();
+        for (const it of items) if (it && it.text != null) {
+          const k = pk.normName(it.text);
+          if (!idx.has(k)) idx.set(k, it);
+        }
+        this._idx = idx;
+        this._idxSrc = items;
+        this._idxLen = items.length;
+      }
+      return this._idx.get(pk.normName(text)) || null;
     }
 
     // ------------------------------------------------------------------
@@ -271,21 +284,26 @@
         if (!n) throw this._diagnose(key, since);
         return n;
       } finally {
-        const extra = res && res.instance ? [res.instance] : [];
-        try {
-          const all = created.concat(extra).filter(Boolean);
-          if (all.length && typeof IC.removeInstances === 'function') IC.removeInstances(all);
-        } catch (_) {
-          /* instance déjà retirée par le jeu */
-        }
-        for (const i of created) this.ourInstances.delete(i);
         this.capWaiters.delete(key);
-        // annulation / délai : la fusion du jeu continue ; on retirera son résultat à la fin
+        const cleanup = (r) => {
+          try {
+            const all = created.concat(r && r.instance ? [r.instance] : []).filter(Boolean);
+            if (all.length && typeof IC.removeInstances === 'function') IC.removeInstances(all);
+          } catch (_) {
+            /* instance déjà retirée par le jeu */
+          }
+          for (const i of created) this.ourInstances.delete(i);
+        };
         if (craftP && res === undefined) {
-          craftP
-            .then((late) => late && late.instance && IC.removeInstances([late.instance]))
-            .catch(() => {});
-        }
+          // Stop / délai dépassé : la fusion du jeu est encore en cours. Retirer ses
+          // instances maintenant pourrait perturber le jeu (et la relance suivante) :
+          // on attend qu'elle se termine (au plus 30 s) avant de nettoyer.
+          const guard = setTimeout(() => cleanup(null), 30000);
+          craftP.then(
+            (late) => (clearTimeout(guard), cleanup(late)),
+            () => (clearTimeout(guard), cleanup(null))
+          );
+        } else cleanup(res);
       }
     }
 
