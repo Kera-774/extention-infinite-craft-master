@@ -45,6 +45,11 @@
         return engine.snapshot();
       case 'searchElements':
         return engine.searchElements(p.q, p.limit);
+      case 'diagnose':
+        return engine.diagnose();
+      case 'resetSettings':
+        engine.resetSettings();
+        return { settings: engine.settings };
       case 'reloadGame':
         await engine.stop();
         engine.game.reloadGame();

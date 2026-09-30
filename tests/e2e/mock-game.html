@@ -17,6 +17,7 @@
     r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
   });
   const SAVE = 1;
+  const FIRE_FORGET = location.search.includes('fireforget');
   let items = await new Promise((res) => {
     const q = db.transaction('items').objectStore('items').getAll();
     q.onsuccess = () => res(q.result.filter((x) => x.saveId === SAVE));
@@ -58,7 +59,8 @@
     getItems: () => vue.items,
     getInstances: () => instances,
     createInstance: async (o) => { const i = { id: ++instanceId, ...o }; instances.push(i); return i; },
-    craft: (a, b) => vue.craft(a, b),
+    // ?fireforget : IC.craft rend la main immédiatement (fusion + animation en arrière-plan)
+    craft: (a, b) => (FIRE_FORGET ? void vue.craft(a, b) : vue.craft(a, b)),
     removeInstances: (list) => { for (const i of list) { const k = instances.indexOf(i); if (k >= 0) instances.splice(k, 1); } }
   };
   window.__mock = { vue, instances, db };

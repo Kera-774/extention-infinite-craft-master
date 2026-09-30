@@ -14,6 +14,19 @@ Chrome 116 ou plus récent est requis (content scripts `world: "MAIN"` et side p
 
 > Premier lancement conseillé : exportez votre partie avec l'export intégré au jeu, puis lancez 2 à 3 minutes en **ÉCO** et vérifiez que les nouveaux éléments apparaissent dans l'inventaire.
 
+## Nouveautés de la v1.2 : plus aucun blocage
+
+Symptôme corrigé : après avoir touché à quelque chose, plus rien ne fusionnait (0 requête/s, file à 0, méthode `dom`), même après avoir quitté le site ou l'extension.
+
+- **Plus de descente sans retour vers `dom`.** Une méthode en échec est mise de côté 5 minutes, puis réessayée. `dom`, expérimental, n'est plus jamais choisi automatiquement. Si toutes les méthodes échouent, le moteur fait une pause de 60 s, recommence du début et affiche la dernière erreur. Il ne se met plus en pause définitive.
+- **Erreurs rattachées à la bonne méthode.** Les requêtes encore en vol pendant un changement de méthode faisaient accuser la nouvelle méthode. Chaque méthode était alors écartée à tort, l'une après l'autre.
+- **`Retry-After` plafonné à 60 s.** Cloudflare peut demander une heure d'attente, ce qui figeait la boucle sans explication. Un compte à rebours s'affiche désormais dans le panneau.
+- **Méthode `game` fiable même si `IC.craft` rend la main avant la fin de la fusion.** L'extension attend la vraie réponse du jeu (via `craftApi`). Les instances ne sont retirées qu'une fois la fusion terminée.
+- **Anti-blocage.** Toutes les 5 s, si le moteur tourne mais que rien ne se passe depuis 10 s sans raison connue, la boucle est relancée : génération figée abandonnée, réservations périmées libérées. Chaque requête a aussi un délai de garde absolu.
+- **Réglages.** Ils sont stockés dans le site (IndexedDB de neal.fun) et survivent donc à la désinstallation de l'extension. Nouveau bouton **Réglages par défaut** ; le panneau refuse d'enregistrer un formulaire qui n'a pas été chargé. Le délai minimal est de 50 ms quel que soit le réglage, pour éviter un blocage par Cloudflare.
+- **Dépannage.** Le bouton **Diagnostic** essaie chaque méthode sur Eau + Feu et indique celle qui fonctionne dans votre navigateur. Le panneau affiche aussi les 5 dernières erreurs, avec la méthode concernée.
+- **Nouveau test :** `tests/e2e/run-resilience.js`, 13 vérifications. Il reproduit ces pannes : `IC.craft` qui rend la main avant la fin, 429 avec `Retry-After: 3600`, 403 Cloudflare sur tout, `dom` enregistré dans les réglages, génération figée. Il vérifie que le moteur **repart seul** à chaque fois.
+
 ## Nouveautés de la v1.1
 
 - **Arrêt / relance corrigés.** Trois causes rendaient la relance lente, ou la bloquaient :
@@ -224,7 +237,7 @@ Changer de niveau ne perd aucun état : cache, file, statistiques et concurrence
 
 ```bash
 npm test          # tests unitaires : clé de paire, tas, AIMD (dont convergence), planificateur
-npm run test:e2e  # Chromium + extension chargée + maquette du jeu (Playwright requis)
+npm run test:e2e  # Chromium + extension + maquette du jeu : scénario complet puis résilience (Playwright requis)
 ```
 
 **Tests unitaires : 29 sur 29 passent.** Ils couvrent :

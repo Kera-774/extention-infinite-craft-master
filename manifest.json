@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Infinite Craft Explorer",
   "short_name": "ICX",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Automatise Infinite Craft (neal.fun) : exploration priorisée des paires (bandit UCB/Thompson), cache persistant, AIMD, niveaux de puissance.",
   "minimum_chrome_version": "116",
   "icons": {

@@ -16,7 +16,11 @@
   const { makeElement, DEFAULT_WEIGHTS, DEFAULT_SETTINGS } = ICX.scoring;
   const P = ICX.power;
 
-  const BACKENDS = ['game', 'api', 'fetch', 'dom'];
+  // chaîne automatique : 'dom' (expérimental) n'est JAMAIS choisi automatiquement
+  const AUTO_CHAIN = ['game', 'api', 'fetch'];
+  const BACKEND_COOLOFF_MS = 5 * 60 * 1000; // méthode en échec mise de côté 5 min
+  const MAX_SERVER_PAUSE_MS = 60 * 1000; // plafond d'une pause Retry-After
+  const MIN_DELAY_MS = 50; // délai plancher absolu (anti-bannissement Cloudflare)
 
   function defaultSettings(hw) {
     return {
@@ -72,6 +76,10 @@
       this.consecutiveErrors = 0;
       this.forbiddenStreak = 0;
       this.invalidStreak = 0;
+      this.health = {}; // méthode -> { badUntil, lastError, okAt }
+      this.lastErrors = []; // dernières erreurs affichées dans le panneau
+      this.lastActivity = 0;
+      this.refillStartedAt = 0;
       this.stats = {
         failsKnown: 0,
         sessionRequests: 0,
@@ -177,6 +185,7 @@
       this.state = 'idle';
       this.log(`Prêt : ${this.ownedCount()} éléments, ${this.pairs.size} paires connues (stockage : ${storageName})`);
       this._startUiTimer();
+      setInterval(() => this._watchdog(), 5000);
 
       addEventListener('pagehide', () => this.store.emergencySync());
       document.addEventListener('visibilitychange', () => document.hidden && this.store.flush());
@@ -254,6 +263,7 @@
 
     applyLevel() {
       const L = P.effectiveLevel(this.effectiveLevelName(), this.hw, { delayMs: this.settings.delayMs }, this.throttleSteps);
+      L.delayMs = Math.max(MIN_DELAY_MS, L.delayMs);
       this._L = L;
       this.aimd.configure({ min: L.minConc, max: L.maxConc, baseDelayMs: L.delayMs, adaptive: L.adaptive });
       this.planner.setWorkerCount(L.workers);
@@ -281,13 +291,29 @@
     // ------------------------------------------------------------------
     // Contrôles
     // ------------------------------------------------------------------
-    resolveBackend() {
-      const want = this.settings.backend;
+    _available() {
       const caps = this.game.capabilities();
-      const ok = { game: caps.icCraft && caps.craftApi, api: caps.craftApi, fetch: true, dom: caps.vue };
-      if (want !== 'auto' && ok[want]) return want;
-      if (want !== 'auto') this.log(`Backend « ${want} » indisponible, sélection automatique`);
-      return BACKENDS.find((b) => ok[b] && b !== 'dom') || 'fetch';
+      return { game: caps.icCraft && caps.craftApi, api: caps.craftApi, fetch: true, dom: caps.vue };
+    }
+
+    _healthy(b, now) {
+      const h = this.health[b];
+      return !h || !(h.badUntil > now);
+    }
+
+    /**
+     * Méthode à utiliser : le choix manuel s'il est disponible et sain, sinon la
+     * première méthode saine de la chaîne automatique. Jamais « aucune » : si
+     * toutes sont en échec, on reprend celle dont la mise à l'écart finit en premier.
+     */
+    resolveBackend() {
+      const now = Date.now();
+      const ok = this._available();
+      const want = this.settings.backend;
+      if (want !== 'auto' && ok[want] && this._healthy(want, now)) return want;
+      const healthy = AUTO_CHAIN.find((b) => ok[b] && this._healthy(b, now));
+      if (healthy) return healthy;
+      return AUTO_CHAIN.filter((b) => ok[b]).sort((x, y) => (this.health[x]?.badUntil || 0) - (this.health[y]?.badUntil || 0))[0] || 'fetch';
     }
 
     start() {
@@ -306,6 +332,7 @@
       this.consecutiveErrors = this.forbiddenStreak = this.invalidStreak = 0;
       this.emptyRefills = 0;
       this.lastStart = 0;
+      this.lastActivity = now;
       this.state = 'running';
       this.store.setMeta('running', true);
       this.store.flush();
@@ -345,6 +372,70 @@
       })();
       await this.stopping;
       if (this.state === 'idle' && this.game.needsReload && this.settings.reloadOnStop) this.game.reloadGame();
+    }
+
+    /**
+     * Anti-blocage : toutes les 5 s, si le moteur est censé tourner mais que rien
+     * ne se passe depuis 10 s sans raison connue (pause serveur, refroidissement),
+     * on libère les réservations périmées, on abandonne une génération figée et
+     * on relance la boucle.
+     */
+    _watchdog() {
+      if (this.state !== 'running') return;
+      const now = Date.now();
+      if (this.aimd.pausedUntil > now || now < this.guard.coolingUntil) return;
+      if (this.inflight.size > 0 || now - this.lastActivity < 10000) return;
+      if (this.refilling && now - this.refillStartedAt < 10000) return;
+      this.log('Anti-blocage : aucune activité depuis 10 s, relance de la boucle');
+      this.refilling = null;
+      const inHeap = new Set(this.heap.toArray().map((c) => c.key));
+      for (const k of [...this.planner.local.reserved]) if (!inHeap.has(k)) this.planner.unreserve(k);
+      this.emptyRefills = 0;
+      this.lastActivity = now;
+      this.backend = this.resolveBackend();
+      this.scheduleTick(0);
+    }
+
+    /**
+     * Diagnostic : essaie chaque méthode sur Water + Fire (recette connue, sans
+     * effet sur la partie) et renvoie ce qui fonctionne. Met le moteur en pause.
+     */
+    async diagnose() {
+      if (this.state === 'running') this.pause();
+      const ok = this._available();
+      const out = { caps: this.game.capabilities(), settingsBackend: this.settings.backend, results: [] };
+      for (const b of ['game', 'api', 'fetch']) {
+        if (!ok[b]) {
+          out.results.push({ backend: b, ok: false, error: 'indisponible (API du jeu non détectée)' });
+          continue;
+        }
+        const t0 = Date.now();
+        try {
+          const r = await this.game.craft(b, 'Fire', 'Water', { timeoutMs: 15000 });
+          out.results.push({ backend: b, ok: true, ms: Date.now() - t0, result: `${r.emoji || ''} ${r.text}` });
+          this.health[b] = { okAt: Date.now() };
+        } catch (err) {
+          out.results.push({ backend: b, ok: false, ms: Date.now() - t0, error: `${err.kind || 'erreur'} : ${err.message}` });
+        }
+      }
+      const good = out.results.find((r) => r.ok);
+      this.log('Diagnostic : ' + out.results.map((r) => `${r.backend} ${r.ok ? 'OK' : 'KO'}`).join(', '));
+      out.recommendation = good ? good.backend : null;
+      return out;
+    }
+
+    /** Remet tous les réglages par défaut (le cache des paires est conservé). */
+    resetSettings() {
+      const level = this.settings.level;
+      this.settings = { ...defaultSettings(this.hw), level };
+      this.health = {};
+      this.store.setMeta('settings', this.settings);
+      this.store.flush();
+      this._applyPlannerConfig();
+      this._clearQueue();
+      this.backend = this.resolveBackend();
+      this.applyLevel();
+      this.log('Réglages remis par défaut');
     }
 
     _clearQueue() {
@@ -490,7 +581,7 @@
         return this.scheduleTick(this.aimd.delayMs > 0 ? this.aimd.delayMs : 0);
       }
       // file vide : on attend la génération en cours (ou on en lance une)
-      (this.refilling || this.refill()).then((added) => {
+      this.refill().then((added) => {
         if (this.state !== 'running') return;
         if (added > 0 || this.heap.size > 0) {
           this.emptyRefills = 0;
@@ -545,7 +636,8 @@
 
     /** Alimente la file : ancres = nouveaux éléments en priorité, sinon sélection générale. */
     refill() {
-      if (this.refilling) return this.refilling;
+      // une génération figée depuis plus de 10 s est abandonnée (worker bloqué…)
+      if (this.refilling && Date.now() - this.refillStartedAt < 10000) return this.refilling;
       const L = this.L;
       let opts;
       if (this.focus) {
@@ -559,6 +651,7 @@
         const anchorCount = Math.min(64, Math.max(8, Math.round(L.lookahead / 32)));
         opts = { anchorCount, perAnchor: Math.ceil(L.lookahead / anchorCount), limit: L.lookahead };
       }
+      this.refillStartedAt = Date.now();
       this.refilling = Promise.resolve(this.planner.generate(opts))
         .then((list) => {
           const reserved = this.planner.local.reserved;
@@ -586,8 +679,22 @@
       const ctrl = new AbortController();
       this.inflight.set(c.key, { ctrl, t: Date.now() });
       this.stats.sessionRequests++;
-      this.game
-        .craft(this.backend, c.a, c.b, { signal: ctrl.signal, timeoutMs: this.settings.timeoutMs })
+      this.lastActivity = Date.now();
+      // délai de garde externe : une requête ne peut JAMAIS occuper un emplacement indéfiniment
+      const hardTimeout = this.settings.timeoutMs + 5000;
+      let guard;
+      c.backend = this.backend; // méthode réellement utilisée par CETTE requête
+      const craftP = this.game.craft(c.backend, c.a, c.b, { signal: ctrl.signal, timeoutMs: this.settings.timeoutMs });
+      Promise.race([
+        craftP,
+        new Promise((_, reject) => {
+          guard = setTimeout(() => {
+            ctrl.abort();
+            reject(new ICX.CraftError('timeout', 'aucune réponse après ' + hardTimeout + ' ms'));
+          }, hardTimeout);
+        })
+      ])
+        .finally(() => clearTimeout(guard))
         .then((r) => this.onResult(c, r))
         .catch((err) => this.onError(c, err))
         .finally(() => {
@@ -601,6 +708,8 @@
     // ------------------------------------------------------------------
     onResult(c, r) {
       this.aimd.onSuccess();
+      this.lastActivity = Date.now();
+      this.health[c.backend || this.backend] = { okAt: this.lastActivity };
       this.consecutiveErrors = this.forbiddenStreak = this.invalidStreak = 0;
       this.completions.push(Date.now());
       // game / dom : le jeu ajoute lui-même l'élément ; api / fetch : c'est à nous
@@ -722,17 +831,25 @@
         return;
       }
       this.consecutiveErrors++;
+      this.lastErrors.unshift({ t: now, backend: c.backend || this.backend, kind, message: String(err && err.message) });
+      // une requête lancée avec une AUTRE méthode que la méthode courante (ex. en vol
+      // pendant une bascule) ne doit pas faire accuser la nouvelle méthode
+      const current = !c.backend || c.backend === this.backend;
+      if (this.lastErrors.length > 8) this.lastErrors.pop();
       if (kind === 'rate') {
         this.stats.s429++;
-        this.aimd.onRateLimit(now, err.retryAfterMs);
+        // un Retry-After énorme (Cloudflare) ne doit pas figer la boucle : 60 s max
+        this.aimd.onRateLimit(now, Math.min(err.retryAfterMs || 0, MAX_SERVER_PAUSE_MS));
         requeue(0);
       } else if (kind === 'forbidden' || kind === 'unsupported' || kind === 'invalid') {
         this.stats.errors++;
         this.aimd.onError(now);
-        if (kind === 'forbidden') this.forbiddenStreak++;
-        else this.invalidStreak++;
+        if (current) {
+          if (kind === 'forbidden') this.forbiddenStreak++;
+          else this.invalidStreak++;
+          if (this.forbiddenStreak >= 3 || this.invalidStreak >= 8 || kind === 'unsupported') this._fallbackBackend(err);
+        }
         c.attempts = (c.attempts || 0) + 1;
-        if (this.forbiddenStreak >= 3 || this.invalidStreak >= 8 || kind === 'unsupported') this._fallbackBackend(err);
         if (c.attempts <= this.settings.maxRetries) requeue(0.05);
         else this._drop(c);
       } else {
@@ -744,7 +861,7 @@
         else this._drop(c);
       }
       if (this.consecutiveErrors >= 20) {
-        this.aimd.pausedUntil = now + 30000;
+        this.aimd.pausedUntil = Math.max(this.aimd.pausedUntil, now + 30000);
         this.consecutiveErrors = 0;
         this.log('20 erreurs consécutives : pause automatique de 30 s');
       }
@@ -756,19 +873,27 @@
       this.planner.unreserve(c.key);
     }
 
+    /** Met la méthode courante de côté et passe à la suivante ; jamais de blocage définitif. */
     _fallbackBackend(err) {
-      const caps = this.game.capabilities();
-      const ok = { game: caps.icCraft && caps.craftApi, api: caps.craftApi, fetch: true, dom: caps.vue };
-      const i = BACKENDS.indexOf(this.backend);
-      const next = BACKENDS.slice(i + 1).find((b) => ok[b]);
+      const now = Date.now();
+      const failed = this.backend;
+      this.health[failed] = { ...(this.health[failed] || {}), badUntil: now + BACKEND_COOLOFF_MS, lastError: err.message };
       this.forbiddenStreak = this.invalidStreak = 0;
-      if (!next) {
-        this.log('Aucun backend fonctionnel (' + err.message + ') : pause');
-        this.pause();
+      const ok = this._available();
+      const next = AUTO_CHAIN.find((b) => ok[b] && b !== failed && this._healthy(b, now));
+      if (next) {
+        this.log(`Méthode ${failed} en échec (${err.message}) → ${next} (nouvel essai de ${failed} dans 5 min)`);
+        this.backend = next;
         return;
       }
-      this.log(`Backend ${this.backend} en échec (${err.message}) → ${next}`);
-      this.backend = next;
+      // toutes les méthodes échouent : pause de 60 s puis on recommence du début
+      for (const b of AUTO_CHAIN) if (this.health[b]) this.health[b].badUntil = 0;
+      this.backend = AUTO_CHAIN.find((b) => ok[b]) || 'fetch';
+      this.aimd.pausedUntil = Math.max(this.aimd.pausedUntil, now + 60000);
+      this.log(
+        `Aucune méthode ne répond (dernière erreur : ${err.message}). Nouvel essai dans 60 s avec ${this.backend}. ` +
+          (err.kind === 'forbidden' ? 'Cloudflare bloque les requêtes : rechargez la page du jeu et faites une fusion à la main.' : '')
+      );
     }
 
     // ------------------------------------------------------------------
@@ -865,6 +990,10 @@
         cooling: now < this.guard.coolingUntil,
         recent: this.recent.slice(0, 20),
         focus: this.focusSnapshot(),
+        lastErrors: this.lastErrors.slice(0, 5),
+        serverPauseS: Math.max(0, Math.ceil((this.aimd.pausedUntil - now) / 1000)),
+        health: this.health,
+        settingsBackend: this.settings.backend,
         lastFocus: this.lastFocus || null,
         logs: this.logs.slice(0, 12),
         storage: this.storageName,

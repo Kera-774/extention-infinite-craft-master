@@ -89,7 +89,7 @@
 
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (!msg || msg.type !== 'icx-cmd') return;
-    requestPage(msg.cmd, msg.payload, msg.cmd === 'exportCache' || msg.cmd === 'importCache' ? 120000 : 30000).then(
+    requestPage(msg.cmd, msg.payload, msg.cmd === 'exportCache' || msg.cmd === 'importCache' || msg.cmd === 'diagnose' ? 120000 : 30000).then(
       (result) => sendResponse({ ok: true, result }),
       (err) => sendResponse({ ok: false, error: String(err && err.message) })
     );

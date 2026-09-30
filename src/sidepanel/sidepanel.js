@@ -9,6 +9,7 @@ const $ = (id) => document.getElementById(id);
 let tabId = null;
 let settings = null;
 let lastRecentKey = '';
+let settingsLoaded = false; // n'enregistre jamais un formulaire non rempli (écraserait les réglages)
 
 // --- Onglet cible ------------------------------------------------------------
 async function findTab() {
@@ -40,6 +41,7 @@ async function loadState() {
     const s = await send('getState');
     settings = s.settings;
     fillSettings(settings);
+    settingsLoaded = true;
     render(s.snapshot);
   } catch (err) {
     showWarnings([{ text: 'Extension pas encore active dans cet onglet : rechargez la page du jeu. (' + err.message + ')', error: true }]);
@@ -133,7 +135,18 @@ function render(s) {
 
   renderFocus(s.focus, s.lastFocus);
 
+  $('errors').replaceChildren(
+    ...(s.lastErrors || []).map((e) => {
+      const li = document.createElement('li');
+      li.textContent = `${new Date(e.t).toLocaleTimeString()} [${e.backend}] ${e.kind} : ${e.message}`;
+      return li;
+    })
+  );
+
   const w = [];
+  if (s.state === 'running' && s.serverPauseS > 0) w.push({ text: `Pause demandée par le serveur (429 / erreurs) : reprise automatique dans ${s.serverPauseS} s.` });
+  if (s.settingsBackend === 'dom') w.push({ text: 'Méthode « glisser-déposer » choisie dans les réglages : elle est expérimentale. Si rien ne fusionne, remettez « Auto ».', error: true });
+  if (s.state === 'paused') w.push({ text: 'En pause : cliquez sur Démarrer pour reprendre.' });
   if (s.cooling) w.push({ text: 'Pause de refroidissement en cours…' });
   if (s.needsReload) w.push({ text: 'Certains éléments n’ont pas pu être ajoutés à chaud : rechargez le jeu pour les voir.', action: 'reload' });
   if (s.materializeError) w.push({ text: 'Ajout à l’inventaire : ' + s.materializeError, error: true });
@@ -277,6 +290,7 @@ for (const b of document.querySelectorAll('#levels button')) b.onclick = act(() 
 
 $('settings').onsubmit = async (ev) => {
   ev.preventDefault();
+  if (!settingsLoaded) return alert('Réglages pas encore chargés depuis la page du jeu : rechargez l’onglet du jeu puis réessayez.');
   try {
     const r = await send('setSettings', readSettings());
     settings = r.settings;
@@ -285,6 +299,34 @@ $('settings').onsubmit = async (ev) => {
     alert(err.message);
   }
 };
+
+$('btn-diagnose').onclick = act(async () => {
+  const list = $('diag');
+  list.hidden = false;
+  list.replaceChildren(Object.assign(document.createElement('li'), { textContent: 'Diagnostic en cours (jusqu’à 45 s)…' }));
+  const d = await send('diagnose');
+  const lines = d.results.map((r) => (r.ok ? `✔ ${r.backend} : ${r.result} (${r.ms} ms)` : `✘ ${r.backend} : ${r.error}`));
+  lines.push(
+    `API du jeu : IC=${d.caps.IC ? 'oui' : 'non'}, Vue=${d.caps.vue ? 'oui' : 'non'}, craftApi=${d.caps.craftApi ? 'oui' : 'non'}, IC.craft=${d.caps.icCraft ? 'oui' : 'non'}`
+  );
+  lines.push(d.recommendation ? `→ Méthode conseillée : ${d.recommendation}` : '→ Aucune méthode ne répond : rechargez la page du jeu, faites une fusion à la main, puis relancez le diagnostic.');
+  list.replaceChildren(...lines.map((t) => Object.assign(document.createElement('li'), { textContent: t })));
+  if (d.recommendation && settings && settings.backend !== 'auto' && settings.backend !== d.recommendation) {
+    if (confirm(`La méthode « ${settings.backend} » est choisie dans les réglages. Passer en « Auto » ?`)) {
+      const r = await send('setSettings', { backend: 'auto' });
+      settings = r.settings;
+      fillSettings(settings);
+    }
+  }
+});
+
+$('btn-reset-settings').onclick = act(async () => {
+  if (!confirm('Remettre tous les réglages par défaut ? (le cache des paires est conservé)')) return;
+  const r = await send('resetSettings');
+  settings = r.settings;
+  fillSettings(settings);
+  settingsLoaded = true;
+});
 
 $('btn-export').onclick = act(async () => {
   const json = await send('exportCache');

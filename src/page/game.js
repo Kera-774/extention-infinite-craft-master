@@ -266,45 +266,92 @@
       const p = this._spawnPoint();
       const mk = (it) => IC.createInstance({ text: it.text, emoji: it.emoji, itemId: it.id, discovery: it.discovery, x: p.x, y: p.y, animate: false });
       const created = [];
-      let res;
-      let craftP = null;
+      // La vraie réponse est celle vue par craftApi. On s'y abonne AVANT la fusion :
+      // IC.craft peut rendre la main avant la fin de la requête (animation), il ne
+      // faut donc ni conclure trop tôt, ni retirer les instances pendant la fusion.
+      const capP = this.waitCaptured(key, timeoutMs);
+      let craftP = Promise.resolve();
       try {
-        const i1 = await mk(ia);
+        const i1 = await withTimeout(Promise.resolve(mk(ia)), 5000, signal);
         created.push(i1);
-        const i2 = await mk(ib);
+        const i2 = await withTimeout(Promise.resolve(mk(ib)), 5000, signal);
         created.push(i2);
         for (const i of created) this.ourInstances.add(i);
-        const captured = this.waitCaptured(key, timeoutMs, signal).catch(() => undefined);
         craftP = Promise.resolve(IC.craft(i1, i2));
-        res = await withTimeout(craftP, timeoutMs, signal);
+        const res = await withTimeout(craftP, timeoutMs, signal);
         const cap = this.captured.get(key);
-        let r = cap && cap.t >= since ? cap.r : await Promise.race([captured, sleep(50).then(() => undefined)]);
-        let n = normalizeResult(r);
-        if (!n && res && res.instance && res.instance.text) n = normalizeResult({ text: res.instance.text, emoji: res.instance.emoji, discovery: res.instance.discovery });
-        if (!n) throw this._diagnose(key, since);
+        let r = cap && cap.t >= since ? cap.r : undefined;
+        if (r === undefined) {
+          const fromInstance = res && res.instance && res.instance.text ? { text: res.instance.text, emoji: res.instance.emoji, discovery: res.instance.discovery } : undefined;
+          // résultat déjà visible sur l'instance : on laisse 300 ms à craftApi pour le drapeau isNew
+          r = fromInstance
+            ? await Promise.race([capP.catch(() => fromInstance), sleep(300).then(() => fromInstance)])
+            : await withTimeout(capP, Math.max(1000, timeoutMs - (Date.now() - since)), signal).catch((err) => {
+                if (err instanceof CraftError && err.kind === 'aborted') throw err;
+                return undefined;
+              });
+        }
+        const n = normalizeResult(r);
+        if (!n) {
+          const d = this._diagnose(key, since);
+          if (r === undefined && d.kind === 'invalid') d.message = 'le jeu n’a renvoyé aucune réponse pour cette fusion';
+          throw d;
+        }
         return n;
       } finally {
-        this.capWaiters.delete(key);
-        const cleanup = (r) => {
-          try {
-            const all = created.concat(r && r.instance ? [r.instance] : []).filter(Boolean);
-            if (all.length && typeof IC.removeInstances === 'function') IC.removeInstances(all);
-          } catch (_) {
-            /* instance déjà retirée par le jeu */
-          }
-          for (const i of created) this.ourInstances.delete(i);
-        };
-        if (craftP && res === undefined) {
-          // Stop / délai dépassé : la fusion du jeu est encore en cours. Retirer ses
-          // instances maintenant pourrait perturber le jeu (et la relance suivante) :
-          // on attend qu'elle se termine (au plus 30 s) avant de nettoyer.
-          const guard = setTimeout(() => cleanup(null), 30000);
-          craftP.then(
-            (late) => (clearTimeout(guard), cleanup(late)),
-            () => (clearTimeout(guard), cleanup(null))
-          );
-        } else cleanup(res);
+        this._deferCleanup(created, craftP, capP, key);
       }
+    }
+
+    /**
+     * Retire les instances temporaires quand la fusion est VRAIMENT finie
+     * (réponse de craftApi reçue ou IC.craft terminé, au plus 30 s), y compris
+     * l'instance résultat créée par le jeu.
+     */
+    _deferCleanup(created, craftP, capP, key) {
+      const IC = this.IC;
+      let done = false;
+      const cleanup = () => {
+        if (done) return;
+        done = true;
+        this.capWaiters.delete(key);
+        const extra = [];
+        try {
+          const cap = this.captured.get(key);
+          const text = cap && cap.r && (cap.r.text || cap.r.result);
+          if (text && typeof IC.getInstances === 'function') {
+            // instance résultat posée au même endroit que nos deux instances
+            const at = created[0];
+            for (const inst of IC.getInstances() || []) {
+              if (!inst || created.includes(inst) || this.ourInstances.has(inst)) continue;
+              if (inst.text === text && at && Math.abs((inst.x ?? 1e9) - at.x) < 80 && Math.abs((inst.y ?? 1e9) - at.y) < 80) extra.push(inst);
+            }
+          }
+        } catch (_) {
+          /* API d'instances différente : on ne retire que les nôtres */
+        }
+        try {
+          const all = created.concat(extra).filter(Boolean);
+          if (all.length && typeof IC.removeInstances === 'function') IC.removeInstances(all);
+        } catch (_) {
+          /* instance déjà retirée par le jeu */
+        }
+        for (const i of created) this.ourInstances.delete(i);
+      };
+      const guard = setTimeout(cleanup, 30000);
+      Promise.allSettled([craftP, capP]).then((rs) => {
+        clearTimeout(guard);
+        const res = rs[0].status === 'fulfilled' ? rs[0].value : null;
+        if (res && res.instance) {
+          try {
+            IC.removeInstances([res.instance]);
+          } catch (_) {
+            /* déjà retirée */
+          }
+        }
+        // petit délai : le jeu pose l'instance résultat juste après la réponse
+        setTimeout(cleanup, 150);
+      });
     }
 
     async craftApi(a, b, signal, timeoutMs) {
